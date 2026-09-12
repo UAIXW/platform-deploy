@@ -1,0 +1,5 @@
+.env
+.DS_Store
+certs/self-signed/server.*
+certs/fullchain.pem
+certs/privkey.pem

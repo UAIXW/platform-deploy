@@ -1,0 +1,278 @@
+# ============================================================================
+# 阿里云 ECS 生产栈 · compose.prod.yml
+#
+# 依据: sso-project-hub/05-reports/aliyun-deploy-plan.html（2026-09-12）
+# 服务器目录: /opt/platform（本目录整体同步上去）
+# 目标环境: 2C4G 单机 All-in-One——SSO 认证中心 + synapse 后端 + skillhub 前端
+#           + skill 扫描栈，nginx 443 统一入口按路径分发
+#
+# 用法:
+#   docker compose -f compose.prod.yml --env-file .env up -d
+#   # CI/CD 滚动更新（GitHub Actions ssh-action 执行）:
+#   TAG=<git-sha> docker compose -f compose.prod.yml pull
+#   TAG=<git-sha> docker compose -f compose.prod.yml up -d
+#   # 回滚 = TAG 指回旧版本镜像 tag
+#
+# 与本地的关键差异（规划 §04）:
+#   1. 共享基建不映射宿主机端口——安全组只开 80/443（8443 备案期临时），
+#      PG/Redis/应用全部走容器网络互通
+#   2. 镜像来自 ACR（GitHub Actions 云端构建，服务器零构建开销、零构建内存峰值）
+#   3. 每个组件按规划 §01 预算表 mem_limit 限额（合计 ~2.8G，余 ~1.2G + 2G swap）
+#   4. NODE_ENV=production：Swagger 自动关闭、helmet 全量生效
+#   5. 无 mailpit：SMTP 走 163/QQ 授权码（备案后切阿里云邮件推送，仅改 SMTP_*）
+#   6. 不上云的: demo-apps 三应用 / synapse dev redis(:6380/:6392) / synapse-redis
+#      （synapse-redis 已砍——代码核查为空转依赖，见规划 P2.5）
+#
+# 目录结构（= /opt/platform）:
+#   compose.prod.yml          本文件
+#   .env                     密钥与镜像 tag（由 .env.example 复制，全部重生成）
+#   deploy-loop.sh            轮询部署脚本（crontab 每 5 分钟：pull + 滚动 + 前端同步）
+#   nginx/platform.conf       统一入口 server 块（80/443/8443）
+#   nginx/routes.inc          三条路由（静态 / synapse / sso），443 与 8443 共用
+#   initdb/                   首启初始化（仅 pg_data 为空时执行，按文件名顺序）:
+#     01-init-synapse.sh         共库分用户（synapse 库 + 账号 + statement_timeout）
+#     02-sso-auth-schema.sql    sso_auth 表结构（源: auth-center/db/migrations）
+#     03-sso-auth-seed.sh       种子数据（管理员密码经环境变量注入）
+#     04-register-synapse-client.sh  注册 synapse 为 SSO 接入应用（S0-1 落地）
+#   certs/                    TLS 证书（P3: fullchain/privkey；备案期: self-signed/）
+#   skillhub-dist/            skillhub 前端构建产物（deploy-loop.sh 从镜像 docker cp 出）
+#   certbot/www/              ACME webroot（certbot 续期用）
+# ============================================================================
+
+name: platform
+
+services:
+
+  # ==========================================================================
+  # 共享基建（中立命名 platform-*，它们不再只服务 SSO）
+  # ==========================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sso
+      POSTGRES_PASSWORD: ${SSO_DB_PASSWORD}
+      POSTGRES_DB: sso_auth
+      # initdb 脚本用（创建 synapse 库 + 独立用户，仅首启 pg_data 为空时执行）
+      SYNAPSE_DB_PASSWORD: ${SYNAPSE_DB_PASSWORD}
+      # initdb/03 生产管理员密码（seed 时写入 users 表）
+      SSO_ADMIN_PASSWORD: ${SSO_ADMIN_PASSWORD}
+      # initdb/04 注册 synapse 为 SSO 接入应用（oauth_clients）用
+      SYNAPSE_SSO_CLIENT_SECRET: ${SYNAPSE_SSO_CLIENT_SECRET}
+      SYNAPSE_REDIRECT_URI: ${SYNAPSE_PUBLIC_URL}/api/auth/sso/callback
+      SYNAPSE_BACKCHANNEL_LOGOUT_URI: ${SYNAPSE_PUBLIC_URL}/api/auth/sso/backchannel-logout
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sso -d sso_auth"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    # 不映射宿主机端口——synapse-api 经容器网络直连，安全组 5432 不开
+
+  redis:
+    # SSO 会话/令牌/限频——绝不驱逐（noeviction），与 scanner 队列分立
+    image: redis:7-alpine
+    container_name: platform-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "100mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 128m
+
+  scanner-redis:
+    # RQ 扫描队列（noeviction + AOF：丢了 = 任务丢失）
+    image: redis:7-alpine
+    container_name: scanner-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - scanner_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 64m
+
+  # ==========================================================================
+  # 应用（镜像来自 ACR；本地值已泄露，密钥全部重生成——规划 §04）
+  # ==========================================================================
+
+  sso-auth:
+    image: ${ACR_REGISTRY}/sso-auth:${TAG:-latest}
+    container_name: sso-auth
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      APP_PORT: 3000
+      DATABASE_URL: postgresql://sso:${SSO_DB_PASSWORD}@platform-postgres:5432/sso_auth
+      REDIS_URL: redis://platform-redis:6379
+      # 对外 issuer：备案期 https://<ECS_IP>:8443/sso → P3 切 https://sso.你的域名.com
+      # （本地已验证 issuer 动态化，切换仅改本值 + nginx cert）
+      ISSUER: ${SSO_ISSUER}
+      COOKIE_KEYS: ${SSO_COOKIE_KEYS}
+      METRICS_TOKEN: ${SSO_METRICS_TOKEN}
+      # 邮件两段式：163/QQ SMTP 授权码（过渡）→ 备案后阿里云邮件推送
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+    volumes:
+      # RS256 签名密钥集持久化（keys/jwks.json，不存在时首启自动生成）——
+      # 不挂卷则容器重建即换钥，所有已签发 JWT 全部失效
+      - sso_jwks:/app/keys
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: 300m
+
+  synapse-api:
+    image: ${ACR_REGISTRY}/synapse-api:${TAG:-latest}
+    container_name: synapse-api
+    restart: unless-stopped
+    # 启动前先应用 Prisma 迁移（幂等；prisma/ 与 CLI 已在镜像内）
+    command: sh -c "npx prisma migrate deploy && node dist/main"
+    environment:
+      NODE_ENV: production
+      PORT: 3100
+      API_PREFIX: /api
+      # 共库分用户：synapse 独立账号仅授权 synapse 库（initdb 脚本创建）
+      DATABASE_URL: postgresql://synapse:${SYNAPSE_DB_PASSWORD}@platform-postgres:5432/synapse?schema=synapse
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      # SSO 接入（BFF 模式，详见 03-checklists/synapse-sso-integration.html）
+      SSO_ISSUER: ${SSO_ISSUER}
+      SSO_CLIENT_ID: synapse
+      SSO_CLIENT_SECRET: ${SYNAPSE_SSO_CLIENT_SECRET}
+      # 对外回调地址走 nginx 路径分发：https://<入口>/api/synapse/api/auth/sso/callback
+      SSO_REDIRECT_URI: ${SYNAPSE_PUBLIC_URL}/api/auth/sso/callback
+      FRONTEND_URL: ${FRONTEND_URL}
+      # 扫描服务与内部回调（容器网络地址）
+      SCANNER_API_URL: http://scanner-api:8000
+      BACKEND_INTERNAL_URL: http://synapse-api:3100
+      INTERNAL_CALLBACK_TOKEN: ${INTERNAL_CALLBACK_TOKEN}
+      # LLM 已切云端 API（本地 LM Studio qwen3.5-9b 不上云，规划 §05）
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_KEY_ENCRYPTION_KEY: ${LLM_KEY_ENCRYPTION_KEY}
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
+      # Supabase Storage（skill-market 文件存储）——上云依赖面待迁移评估，
+      # 过渡期直连（规划 §05 风险项）；迁移完成后删除这两个变量
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      # 注: 无 REDIS_URL——synapse-redis 已砍（SSO 接入清单 S5 移除）；
+      # 若在 SSO 改造完成前先行部署，临时加回 REDIS_URL=redis://platform-redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3100/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 400m
+
+  # ==========================================================================
+  # skill 扫描栈（FastAPI + RQ；LLM 走云端 API，Supabase 直调改写为上云前置）
+  # ==========================================================================
+
+  scanner-api:
+    image: ${ACR_REGISTRY}/scanner-api:${TAG:-latest}
+    container_name: scanner-api
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: scanner-redis
+      # ⚠ 上云前置开发任务（规划 P2.5）：scanner 直调 Supabase API（service key），
+      # 需改写为直连共享 PG——迁移完成后删除这两个变量
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+    depends_on:
+      scanner-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: 256m
+
+  scanner-worker:
+    # 云上先 1 个（本地 2 个）——扫描是异步批任务不追并发，
+    # 且瞬态分析容器（docker.sock 拉起 cisco-skill-scanner）内存另计（规划 §05：
+    # 限并发 1 + 错峰扫描 + 分析容器另设 mem_limit）
+    image: ${ACR_REGISTRY}/scanner-api:${TAG:-latest}
+    container_name: scanner-worker
+    command: rq worker skill_scan --url redis://scanner-redis:6379
+    restart: unless-stopped
+    environment:
+      # ⚠ 同 scanner-api：Supabase 直调改写为上云前置，迁移后删除
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      INTERNAL_CALLBACK_TOKEN: ${INTERNAL_CALLBACK_TOKEN}
+      BACKEND_CALLBACK_URL_BASE: http://synapse-api:3100
+      # LLM 云端 API（OpenAI 兼容端点：DashScope / DeepSeek 等）
+      SKILL_SCANNER_LLM_API_KEY: ${SKILL_SCANNER_LLM_API_KEY}
+      SKILL_SCANNER_LLM_MODEL: ${SKILL_SCANNER_LLM_MODEL}
+      OPENAI_API_BASE: ${OPENAI_API_BASE}
+      # 扫描工作目录（Docker-in-Docker：必须与宿主机共享挂载，
+      # cisco-skill-scanner 容器才能访问到文件）
+      SCAN_WORK_DIR: /tmp/synapse-scans
+    # 附加 root 组，让非 root 的 scanner 用户能访问 /var/run/docker.sock（root:root 660）
+    group_add: ["0"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/synapse-scans:/tmp/synapse-scans
+    depends_on:
+      scanner-redis:
+        condition: service_healthy
+    mem_limit: 384m
+
+  # ==========================================================================
+  # 统一入口（TLS 终结 + 路径分发 + skillhub 静态托管）
+  # ==========================================================================
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: platform-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"    # 跳转 443 + ACME 验证（certbot 续期依赖）
+      - "443:443"  # 正式入口（P3 起 Let's Encrypt）
+      - "8443:8443"  # 备案期 IP + 自签过渡入口，P3 完成后删除
+    volumes:
+      - ./nginx:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./skillhub-dist:/usr/share/nginx/html:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - sso-auth
+      - synapse-api
+    mem_limit: 32m
+
+volumes:
+  pg_data:
+  redis_data:
+  scanner_redis_data:
+  sso_jwks:
