@@ -16,10 +16,18 @@
 #       docker compose -f compose.prod.yml --env-file .env up -d
 #       （轮询会遵循 .env 的 TAG；改回 latest 恢复追新）
 #
-# 安装:
-#   chmod +x /opt/platform/deploy-loop.sh
-#   crontab -e 追加:
-#   */5 * * * * /opt/platform/deploy-loop.sh >> /var/log/platform-deploy.log 2>&1
+# 前置（一次性，配置好后再挂 cron）:
+#   1) docker login $ACR_REGISTRY   ← 拉私有镜像的凭证（ACR 访问凭证的用户名/固定密码）
+#      凭证落在 /root/.docker/config.json，密码不进任何文件
+#   2) chmod +x /opt/platform/deploy-loop.sh
+#   3) crontab -e 追加:
+#      */5 * * * * /opt/platform/deploy-loop.sh >> /var/log/platform-deploy.log 2>&1
+#
+# 配置文件更新（compose/nginx/initdb 变更时）:
+#   服务器无法直连 GitHub（clone 实测超时），也不依赖 SSH:
+#     · 当前: Workbench 文件树上传 platform-deploy.zip → 解压覆盖
+#     · SSH 解封后: 本地 rsync -avz --exclude '.env' deploy/ root@<IP>:/opt/platform/
+#   （.env 永远只在服务器上维护，git/zip 都不带）
 # ============================================================================
 set -uo pipefail
 cd /opt/platform || exit 1

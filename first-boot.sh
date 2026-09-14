@@ -76,6 +76,8 @@ echo "==========================================================================
 echo
 echo "下一步: 填完后起基建验证:"
 echo "  docker compose -f compose.prod.yml --env-file .env up -d postgres redis scanner-redis"
+echo "镜像就绪前先登录 ACR（拉私有镜像的凭证，一次性）:"
+echo "  docker login \$(grep -oP '^ACR_REGISTRY=\\K.*' .env)"
 echo "镜像（sso-auth 等）就绪后全栈:"
 echo "  docker compose -f compose.prod.yml --env-file .env up -d"
 echo "最后挂轮询（正式进入自动部署）:"

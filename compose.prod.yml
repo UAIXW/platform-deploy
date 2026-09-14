@@ -8,10 +8,12 @@
 #
 # 用法:
 #   docker compose -f compose.prod.yml --env-file .env up -d
-#   # CI/CD 滚动更新（GitHub Actions ssh-action 执行）:
-#   TAG=<git-sha> docker compose -f compose.prod.yml pull
-#   TAG=<git-sha> docker compose -f compose.prod.yml up -d
-#   # 回滚 = TAG 指回旧版本镜像 tag
+#   # CI/CD 滚动更新（pull 模式，服务器不向 GitHub 暴露任何端口）:
+#     GitHub Actions build → push ACR → deploy-loop.sh 轮询 pull + 滚动
+#   # 回滚 = .env 的 TAG 改回旧 git-sha 后手动 up -d（改回 latest 恢复追新）
+#
+# 前置（一次性）:
+#   docker login <ACR_REGISTRY> —— deploy-loop.sh 拉私有镜像的凭证，见 .env
 #
 # 与本地的关键差异（规划 §04）:
 #   1. 共享基建不映射宿主机端口——安全组只开 80/443（8443 备案期临时），
