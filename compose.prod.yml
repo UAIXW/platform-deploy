@@ -184,8 +184,8 @@ services:
       SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
       # JwtAuthGuard / auth.service 构造 Supabase client 必需（SSO 改造落地前的登录路径）
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
-      # 注: 无 REDIS_URL——synapse-redis 已砍（SSO 接入清单 S5 移除）；
-      # 若在 SSO 改造完成前先行部署，临时加回 REDIS_URL=redis://platform-redis:6379
+      # 临时：rate-limit 死代码仍尝试连 Redis（SSO 接入清单 S5 落地后删除）
+      REDIS_URL: ${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
