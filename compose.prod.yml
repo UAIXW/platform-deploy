@@ -152,7 +152,7 @@ services:
     container_name: synapse-api
     restart: unless-stopped
     # 启动前先应用 Prisma 迁移（幂等；prisma/ 与 CLI 已在镜像内）
-    command: sh -c "npx prisma migrate deploy && node dist/main"
+    command: sh -c "npx prisma migrate deploy && node dist/src/main"
     environment:
       NODE_ENV: production
       PORT: 3100
